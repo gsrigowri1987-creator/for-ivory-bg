@@ -1,0 +1,6 @@
+{
+  "name": "Taj Mahal 3D — Architectural Recreation",
+  "description": "Interactive Three.js 3D recreation of the Taj Mahal with a staged under-10-second construction animation, procedural Makrana marble textures, realistic daylight lighting, drifting clouds, and swaying Charbagh garden cypresses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
