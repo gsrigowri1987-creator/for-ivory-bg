@@ -80,13 +80,15 @@ function createPointedArchFrameGeometry(
 }
 
 /**
- * Create an authentic bulbous Mughal onion dome via LatheGeometry with subtle baked vertical AO vertex colors.
+ * Create an authentic bulbous Mughal onion dome via LatheGeometry with optional carved vertical fluting
+ * (for chhatri domes) and subtle baked vertical/flute AO vertex colors.
  */
 function createOnionDomeGeometry(
   baseRadius: number,
   maxRadius: number,
   height: number,
   radialSegments = 48,
+  fluteCount = 0,
 ): THREE.LatheGeometry {
   const profile: Array<[number, number]> = [
     [baseRadius * 0.99, 0.0],
@@ -104,21 +106,363 @@ function createOnionDomeGeometry(
     [0.0, 1.0],
   ];
 
+  const segs = fluteCount > 0 ? Math.max(radialSegments, fluteCount * 4) : radialSegments;
   const points = profile.map(([r, t]) => new THREE.Vector2(r, t * height));
-  const geo = new THREE.LatheGeometry(points, radialSegments);
-  geo.computeVertexNormals();
+  const geo = new THREE.LatheGeometry(points, segs);
 
-  // Bake subtle vertical contact ambient occlusion at dome neck collar (photographic stone realism)
-  const pos = geo.attributes.position;
+  const pos = geo.attributes.position as THREE.BufferAttribute;
   const colors = new Float32Array(pos.count * 3);
+
   for (let i = 0; i < pos.count; i += 1) {
-    const t = Math.max(0, Math.min(1, pos.getY(i) / height));
-    const ao = t < 0.16 ? 0.8 + (t / 0.16) * 0.2 : 0.98 + 0.02 * t;
+    let vx = pos.getX(i);
+    const vy = pos.getY(i);
+    let vz = pos.getZ(i);
+    const t = Math.max(0, Math.min(1, vy / Math.max(height, 0.001)));
+
+    let fluteAo = 1.0;
+    if (fluteCount > 0) {
+      const r = Math.hypot(vx, vz);
+      if (r > 0.02) {
+        const ang = Math.atan2(vz, vx);
+        const envelope = Math.pow(Math.sin(t * Math.PI), 0.72);
+        const ribWave = Math.cos(ang * fluteCount);
+        const scaleR = 1.0 + 0.036 * ribWave * envelope;
+        vx *= scaleR;
+        vz *= scaleR;
+        pos.setXYZ(i, vx, vy, vz);
+        // Subtle crevice AO inside carved flute troughs so ribs catch golden raking sunlight
+        fluteAo = 0.91 + 0.09 * (0.5 + 0.5 * ribWave) * envelope + (1 - envelope) * 0.09;
+      }
+    }
+
+    const neckAo = t < 0.16 ? 0.78 + (t / 0.16) * 0.22 : 0.98 + 0.02 * t;
+    const ao = neckAo * fluteAo;
     colors[i * 3] = ao;
     colors[i * 3 + 1] = ao * 0.995;
     colors[i * 3 + 2] = ao * 0.985;
   }
+
+  geo.computeVertexNormals();
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return geo;
+}
+
+/**
+ * Create a chamfered/beveled stone slab centered at (0, 0, 0) so golden sunlight catches crisp rim highlights.
+ */
+function createBeveledBoxGeometry(
+  width: number,
+  height: number,
+  depth: number,
+  bevel = 0.075,
+): THREE.ExtrudeGeometry {
+  const b = Math.min(bevel, width * 0.22, height * 0.35, depth * 0.22);
+  const hw = Math.max(0.02, width * 0.5 - b);
+  const hd = Math.max(0.02, depth * 0.5 - b);
+  const coreH = Math.max(0.02, height - b * 2);
+
+  const shape = new THREE.Shape();
+  shape.moveTo(-hw, -hd);
+  shape.lineTo(hw, -hd);
+  shape.lineTo(hw, hd);
+  shape.lineTo(-hw, hd);
+  shape.closePath();
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: coreH,
+    bevelEnabled: true,
+    bevelThickness: b,
+    bevelSize: b,
+    bevelSegments: 2,
+  });
+  geo.rotateX(-Math.PI * 0.5);
+  geo.translate(0, -coreH * 0.5, 0);
+
+  // Planar world-scaled UVs for crisp marble/sandstone texture alignment
+  const pos = geo.attributes.position as THREE.BufferAttribute;
+  const uv = geo.attributes.uv as THREE.BufferAttribute;
+  const nrm = geo.attributes.normal as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i += 1) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const z = pos.getZ(i);
+    const ny = Math.abs(nrm.getY(i));
+    if (ny > 0.6) {
+      uv.setXY(i, x * 0.08 + 0.5, z * 0.08 + 0.5);
+    } else if (Math.abs(nrm.getX(i)) > 0.6) {
+      uv.setXY(i, z * 0.08 + 0.5, y * 0.22 + 0.5);
+    } else {
+      uv.setXY(i, x * 0.08 + 0.5, y * 0.22 + 0.5);
+    }
+  }
+  uv.needsUpdate = true;
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/** Merge an array of positioned box/cylinder primitives into a single BufferGeometry. */
+function appendGeometryToBuffers(
+  src: THREE.BufferGeometry,
+  matrix: THREE.Matrix4,
+  positions: number[],
+  normals: number[],
+  uvs: number[],
+  indices: number[],
+  vertOffset: number,
+): number {
+  const pAttr = src.attributes.position as THREE.BufferAttribute;
+  const nAttr = src.attributes.normal as THREE.BufferAttribute;
+  const uvAttr = src.attributes.uv as THREE.BufferAttribute | undefined;
+  const normMat = new THREE.Matrix3().getNormalMatrix(matrix);
+  const v = new THREE.Vector3();
+  const n = new THREE.Vector3();
+
+  for (let i = 0; i < pAttr.count; i += 1) {
+    v.fromBufferAttribute(pAttr, i).applyMatrix4(matrix);
+    n.fromBufferAttribute(nAttr, i).applyMatrix3(normMat).normalize();
+    positions.push(v.x, v.y, v.z);
+    normals.push(n.x, n.y, n.z);
+    if (uvAttr) {
+      uvs.push(uvAttr.getX(i), uvAttr.getY(i));
+    } else {
+      uvs.push(v.x * 0.25, v.y * 0.25);
+    }
+  }
+
+  const idx = src.index;
+  if (idx) {
+    for (let i = 0; i < idx.count; i += 1) {
+      indices.push(idx.getX(i) + vertOffset);
+    }
+  } else {
+    for (let i = 0; i < pAttr.count; i += 1) {
+      indices.push(i + vertOffset);
+    }
+  }
+  return vertOffset + pAttr.count;
+}
+
+/**
+ * Build physical 3D Mughal Muqarnas (corbelled stalactite honeycomb vaulting) tucked inside
+ * the upper vaulted head of each Great Pishtaq iwan.
+ * Combines a recessed carved semi-dome marble hood with brick-staggered interlocking honeycomb
+ * niches and soft corbelled pendentive facets so the vault reads as one seamless block of
+ * deeply carved, warmly shaded Makrana stone rather than harsh stacked horizontal ridges.
+ */
+function createMuqarnasVaultGeometries(
+  archW: number,
+  archSpringY: number,
+  archPeakY: number,
+  depth: number,
+): { cellsGeo: THREE.BufferGeometry; ribsGeo: THREE.BufferGeometry } {
+  const cPos: number[] = [];
+  const cNrm: number[] = [];
+  const cUv: number[] = [];
+  const cIdx: number[] = [];
+  let cOff = 0;
+
+  const rPos: number[] = [];
+  const rNrm: number[] = [];
+  const rUv: number[] = [];
+  const rIdx: number[] = [];
+  let rOff = 0;
+
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  const unitPendentive = new THREE.ConeGeometry(0.56, 1.0, 4);
+  const unitNicheArch = new THREE.CylinderGeometry(0.5, 0.56, 1.0, 6, 1, false, 0, Math.PI);
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const euler = new THREE.Euler();
+  const p = new THREE.Vector3();
+  const s = new THREE.Vector3();
+
+  const vaultH = archPeakY - archSpringY;
+  const halfSpan = archW * 0.47;
+
+  // Recessed solid carved semi-dome marble backing shell behind the muqarnas tiers
+  // (eliminates hard black gaps and grounds the honeycomb cells inside continuous carved stone)
+  const shellGeo = new THREE.SphereGeometry(
+    1.0,
+    18,
+    10,
+    0,
+    Math.PI,
+    0,
+    Math.PI * 0.52,
+  );
+  // Flip normals inward so the concave inner vault catches soft bounced golden light cleanly
+  const shIdx = shellGeo.index;
+  if (shIdx) {
+    for (let i = 0; i < shIdx.count; i += 3) {
+      const a = shIdx.getX(i + 1);
+      const b = shIdx.getX(i + 2);
+      shIdx.setX(i + 1, b);
+      shIdx.setX(i + 2, a);
+    }
+  }
+  shellGeo.computeVertexNormals();
+  p.set(0, archSpringY + 0.08, -depth * 0.08);
+  euler.set(0, Math.PI, 0, 'YXZ');
+  q.setFromEuler(euler);
+  s.set(halfSpan * 1.02, vaultH * 1.02, depth * 0.94);
+  m.compose(p, q, s);
+  cOff = appendGeometryToBuffers(shellGeo, m, cPos, cNrm, cUv, cIdx, cOff);
+  shellGeo.dispose();
+
+  // 6 finely graduated corbelled honeycomb tiers climbing smoothly into the pointed crown
+  const tiers = [
+    { frac: 0.04, count: 9, radiusFrac: 0.94, zFrac: 0.20, cellH: vaultH * 0.21 },
+    { frac: 0.22, count: 8, radiusFrac: 0.85, zFrac: 0.34, cellH: vaultH * 0.21 },
+    { frac: 0.40, count: 7, radiusFrac: 0.73, zFrac: 0.48, cellH: vaultH * 0.20 },
+    { frac: 0.57, count: 5, radiusFrac: 0.57, zFrac: 0.62, cellH: vaultH * 0.19 },
+    { frac: 0.73, count: 3, radiusFrac: 0.37, zFrac: 0.76, cellH: vaultH * 0.17 },
+    { frac: 0.88, count: 1, radiusFrac: 0.15, zFrac: 0.87, cellH: vaultH * 0.14 },
+  ];
+
+  for (let t = 0; t < tiers.length; t += 1) {
+    const tier = tiers[t];
+    const yBase = archSpringY + tier.frac * vaultH;
+    const tierSpanR = halfSpan * tier.radiusFrac;
+    const zDepthR = depth * (0.86 - tier.zFrac * 0.48);
+
+    for (let i = 0; i < tier.count; i += 1) {
+      // Semi-circular arc from left wall (PI) around back (PI/2) to right wall (0)
+      const u = tier.count === 1 ? 0.5 : (i + 0.5) / tier.count;
+      const theta = Math.PI * (0.07 + u * 0.86);
+      const cx = Math.cos(theta) * tierSpanR;
+      const cz = -depth * 0.09 - Math.sin(theta) * zDepthR;
+      const faceYaw = Math.PI * 0.5 - theta;
+
+      const cellW = Math.max(0.44, ((tierSpanR * Math.PI * 0.88) / Math.max(tier.count, 1)) * 0.90);
+
+      // 1. Deeply carved recessed arched honeycomb cell hood (shaded warm marble vault tone)
+      p.set(cx, yBase + tier.cellH * 0.52, cz);
+      euler.set(0.28, faceYaw, 0, 'YXZ');
+      q.setFromEuler(euler);
+      s.set(cellW, tier.cellH * 1.06, 0.30);
+      m.compose(p, q, s);
+      cOff = appendGeometryToBuffers(unitNicheArch, m, cPos, cNrm, cUv, cIdx, cOff);
+
+      // 2. Soft sculpted stalactite pendentive facet hanging organically between cell arches
+      p.set(cx, yBase + tier.cellH * 0.12, cz + Math.sin(theta) * 0.15);
+      euler.set(Math.PI, faceYaw + Math.PI * 0.25, 0, 'YXZ');
+      q.setFromEuler(euler);
+      s.set(cellW * 0.42, tier.cellH * 0.56, 0.24);
+      m.compose(p, q, s);
+      rOff = appendGeometryToBuffers(unitPendentive, m, rPos, rNrm, rUv, rIdx, rOff);
+
+      // 3. Delicate angled diamond squinch facet bridging consecutive tiers (subtle carved relief, no stark horizontal bars)
+      p.set(cx, yBase + tier.cellH * 0.86, cz + Math.sin(theta) * 0.14);
+      euler.set(0.32, faceYaw, Math.PI * 0.08 * (i % 2 === 0 ? 1 : -1), 'YXZ');
+      q.setFromEuler(euler);
+      s.set(cellW * 0.62, 0.065, 0.14);
+      m.compose(p, q, s);
+      rOff = appendGeometryToBuffers(unitBox, m, rPos, rNrm, rUv, rIdx, rOff);
+    }
+  }
+
+  unitBox.dispose();
+  unitPendentive.dispose();
+  unitNicheArch.dispose();
+
+  const cellsGeo = new THREE.BufferGeometry();
+  cellsGeo.setAttribute('position', new THREE.Float32BufferAttribute(cPos, 3));
+  cellsGeo.setAttribute('normal', new THREE.Float32BufferAttribute(cNrm, 3));
+  cellsGeo.setAttribute('uv', new THREE.Float32BufferAttribute(cUv, 2));
+  cellsGeo.setIndex(cIdx);
+  cellsGeo.computeBoundingSphere();
+
+  const ribsGeo = new THREE.BufferGeometry();
+  ribsGeo.setAttribute('position', new THREE.Float32BufferAttribute(rPos, 3));
+  ribsGeo.setAttribute('normal', new THREE.Float32BufferAttribute(rNrm, 3));
+  ribsGeo.setAttribute('uv', new THREE.Float32BufferAttribute(rUv, 2));
+  ribsGeo.setIndex(rIdx);
+  ribsGeo.computeBoundingSphere();
+
+  return { cellsGeo, ribsGeo };
+}
+
+/**
+ * Build physical 3D carved Mughal Jali marble latticework screen (intersecting stone mullions +
+ * 45-degree geometric star-diamond filigree) so arched niches cast real micro-shadows.
+ */
+function createJaliLattice3DGeometry(
+  width: number,
+  height: number,
+  cols: number,
+  rows: number,
+  barThick = 0.055,
+  depth = 0.11,
+): THREE.BufferGeometry {
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  let offset = 0;
+
+  const unitBox = new THREE.BoxGeometry(1, 1, 1);
+  const m = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const euler = new THREE.Euler();
+  const p = new THREE.Vector3();
+  const s = new THREE.Vector3();
+
+  const addBar = (x: number, y: number, w: number, h: number, rotZ = 0) => {
+    p.set(x, y, 0);
+    euler.set(0, 0, rotZ);
+    q.setFromEuler(euler);
+    s.set(w, h, depth);
+    m.compose(p, q, s);
+    offset = appendGeometryToBuffers(unitBox, m, positions, normals, uvs, indices, offset);
+  };
+
+  // Outer stone frame + recessed inner molding bead
+  const frameT = barThick * 1.42;
+  addBar(0, height * 0.5 - frameT * 0.5, width, frameT);
+  addBar(0, -height * 0.5 + frameT * 0.5, width, frameT);
+  addBar(-width * 0.5 + frameT * 0.5, 0, frameT, height);
+  addBar(width * 0.5 - frameT * 0.5, 0, frameT, height);
+
+  // Crisp vertical mullions & horizontal transoms
+  const cellW = width / cols;
+  const cellH = height / rows;
+  for (let c = 1; c < cols; c += 1) {
+    const x = -width * 0.5 + c * cellW;
+    addBar(x, 0, barThick * 0.92, height - frameT);
+  }
+  for (let r = 1; r < rows; r += 1) {
+    const y = -height * 0.5 + r * cellH;
+    addBar(0, y, width - frameT, barThick * 0.92);
+  }
+
+  // Fine Mughal geometric star-diamond filigree + carved octagonal rosette nodes inside each cell
+  const diagLen = Math.hypot(cellW, cellH) * 0.95;
+  const diagAngle = Math.atan2(cellH, cellW);
+  const fineT = barThick * 0.58;
+  const starR = Math.min(cellW, cellH) * 0.24;
+  for (let c = 0; c < cols; c += 1) {
+    for (let r = 0; r < rows; r += 1) {
+      const cx = -width * 0.5 + (c + 0.5) * cellW;
+      const cy = -height * 0.5 + (r + 0.5) * cellH;
+      addBar(cx, cy, diagLen, fineT, diagAngle);
+      addBar(cx, cy, diagLen, fineT, -diagAngle);
+
+      // Carved diamond collar framing the central pierced star opening
+      addBar(cx, cy + starR, starR * 1.35, fineT * 0.85, 0);
+      addBar(cx, cy - starR, starR * 1.35, fineT * 0.85, 0);
+      addBar(cx - starR, cy, fineT * 0.85, starR * 1.35, 0);
+      addBar(cx + starR, cy, fineT * 0.85, starR * 1.35, 0);
+    }
+  }
+
+  unitBox.dispose();
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
   return geo;
 }
 
@@ -331,10 +675,10 @@ function createChhatriPavilion(
   drumRing.position.y = curY + columnHeight + 0.76 + drumH * 0.85;
   group.add(drumRing);
 
-  // Onion dome
+  // Fluted/ribbed carved Mughal chhatri onion dome (16 sculpted vertical ribs catch golden rim light)
   const domeY = curY + columnHeight + 0.75 + drumH;
   const dome = new THREE.Mesh(
-    trackGeo(createOnionDomeGeometry(radius * 0.88, radius * 1.08, domeHeight, 28)),
+    trackGeo(createOnionDomeGeometry(radius * 0.88, radius * 1.08, domeHeight, 48, 16)),
     materials.marbleDome,
   );
   dome.position.y = domeY;
@@ -378,9 +722,11 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
   const pH = TAJ_DIMS.plinthH;
   const pD = TAJ_DIMS.plinthD;
 
-  // Inner shaded core behind blind arches (deep warm recessed shadow tone)
+  const localMaterials: THREE.Material[] = [];
+
+  // Inner deeply recessed core behind blind arches (pushed back 0.80m for true physical architectural depth)
   const plinthCore = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(pW - 0.76, pH - 0.12, pD - 0.76)),
+    trackGeo(new THREE.BoxGeometry(pW - 1.62, pH - 0.12, pD - 1.62)),
     materials.marbleShadowRecess,
   );
   plinthCore.position.y = pH * 0.5;
@@ -396,19 +742,19 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
   corniceShadow.position.y = pH - 0.34;
   plinthGroup.add(corniceShadow);
 
-  // Top polished checkered Makrana marble terrace deck
+  // Top polished checkered Makrana marble terrace deck with chamfered/beveled stone edge catching golden rim light
   const plinthDeck = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(pW + 0.62, 0.34, pD + 0.62)),
+    trackGeo(createBeveledBoxGeometry(pW + 0.66, 0.38, pD + 0.66, 0.085)),
     materials.marbleDeck,
   );
-  plinthDeck.position.y = pH - 0.1;
+  plinthDeck.position.y = pH - 0.08;
   plinthDeck.castShadow = true;
   plinthDeck.receiveShadow = true;
   plinthGroup.add(plinthDeck);
 
-  // Stepped marble base skirt resting solidly on the red sandstone terrace
+  // Stepped chamfered marble base skirt resting solidly on the red sandstone terrace
   const plinthSkirt = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(pW + 0.56, 0.44, pD + 0.56)),
+    trackGeo(createBeveledBoxGeometry(pW + 0.58, 0.44, pD + 0.58, 0.075)),
     materials.marbleTrim,
   );
   plinthSkirt.position.y = 0.22;
@@ -416,7 +762,7 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
   plinthGroup.add(plinthSkirt);
 
   const plinthBaseLine = new THREE.Mesh(
-    trackGeo(new THREE.BoxGeometry(pW + 0.62, 0.1, pD + 0.62)),
+    trackGeo(new THREE.BoxGeometry(pW + 0.64, 0.1, pD + 0.64)),
     materials.darkInlayStone,
   );
   plinthBaseLine.position.y = 0.05;
@@ -428,32 +774,85 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
   mausContact.position.y = pH + 0.09;
   plinthGroup.add(mausContact);
 
-  // Rhythmic blind-arch arcade along all 4 faces of the plinth (23 niches per side, matching the photo!)
+  // Rhythmic deeply recessed blind-arch arcade along all 4 faces of the plinth (23 niches per side)
+  // with physical 0.78m architectural depth, recessed sub-arch lip, and smooth baked top-to-bottom AO gradient!
   const nicheCount = 23;
   const arcadeSpan = pW - 1.2;
   const bayW = arcadeSpan / nicheCount;
+  const nicheH = pH - 0.8;
+  const nicheDepth = 0.78;
   const nicheFrameGeo = trackGeo(
     createPointedArchFrameGeometry(
       bayW - 0.03,
-      pH - 0.8,
-      bayW * 0.64,
-      (pH - 0.8) * 0.46,
-      (pH - 0.8) * 0.84,
-      0.46,
+      nicheH,
+      bayW * 0.65,
+      nicheH * 0.46,
+      nicheH * 0.85,
+      nicheDepth,
     ),
   );
-  const pilasterGeo = trackGeo(new THREE.BoxGeometry(0.22, pH - 0.48, 0.56));
+  const pilasterGeo = trackGeo(new THREE.BoxGeometry(0.24, pH - 0.46, 0.86));
+
+  // Recessed back panel with smooth baked ambient occlusion gradient (deep slate-shadow arch soffit -> softly lit lower marble)
+  const nicheBackGeo = trackGeo(new THREE.PlaneGeometry(bayW * 0.78, nicheH * 0.94, 4, 6));
+  {
+    const pos = nicheBackGeo.attributes.position as THREE.BufferAttribute;
+    const cols = new Float32Array(pos.count * 3);
+    const halfW = bayW * 0.39;
+    const halfH = nicheH * 0.47;
+    const topAoColor = new THREE.Color('#2d3749');    // deep cool-slate soffit occlusion inside arch apex
+    const midAoColor = new THREE.Color('#6f7580');    // recessed cool-warm shaded marble mid-wall
+    const lowBounceColor = new THREE.Color('#b6aea1'); // soft warm terrace bounce light at lower niche
+    const cTmp = new THREE.Color();
+    for (let i = 0; i < pos.count; i += 1) {
+      const x = pos.getX(i);
+      const y = pos.getY(i);
+      const u = Math.min(1, Math.abs(x) / Math.max(halfW, 0.01)); // 0 at center -> 1 at jamb edges
+      const v = Math.max(0, Math.min(1, (y + halfH) / Math.max(halfH * 2, 0.01))); // 0 at bottom -> 1 at top
+      // Smooth vertical AO gradient (darkest under arch hood + subtle ground contact shadow at very bottom)
+      if (v > 0.48) {
+        cTmp.copy(midAoColor).lerp(topAoColor, Math.pow((v - 0.48) / 0.52, 0.85));
+      } else {
+        cTmp.copy(lowBounceColor).lerp(midAoColor, v / 0.48);
+      }
+      // Side-jamb crevice occlusion + subtle bottom plinth contact darkening
+      const jambAo = 1.0 - Math.pow(u, 1.8) * 0.38;
+      const bottomAo = v < 0.14 ? 0.78 + (v / 0.14) * 0.22 : 1.0;
+      cTmp.multiplyScalar(jambAo * bottomAo);
+      cols[i * 3] = cTmp.r;
+      cols[i * 3 + 1] = cTmp.g;
+      cols[i * 3 + 2] = cTmp.b;
+    }
+    nicheBackGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  }
+  const plinthAoBackMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    roughness: 0.86,
+    metalness: 0.0,
+    envMapIntensity: 0.28,
+  });
+  localMaterials.push(plinthAoBackMat);
+
+  // Subtle recessed inner dado sill ledge inside every blind arch for real carved stonework depth
+  const nicheSillGeo = trackGeo(new THREE.BoxGeometry(bayW * 0.66, 0.16, 0.34));
 
   const arcadeFaces: Array<{ rotY: number; offsetZ: number }> = [
-    { rotY: 0, offsetZ: pD * 0.5 - 0.42 },
-    { rotY: Math.PI, offsetZ: pD * 0.5 - 0.42 },
-    { rotY: Math.PI * 0.5, offsetZ: pW * 0.5 - 0.42 },
-    { rotY: -Math.PI * 0.5, offsetZ: pW * 0.5 - 0.42 },
+    { rotY: 0, offsetZ: pD * 0.5 - 0.76 },
+    { rotY: Math.PI, offsetZ: pD * 0.5 - 0.76 },
+    { rotY: Math.PI * 0.5, offsetZ: pW * 0.5 - 0.76 },
+    { rotY: -Math.PI * 0.5, offsetZ: pW * 0.5 - 0.76 },
   ];
 
   const nicheInst = new THREE.InstancedMesh(nicheFrameGeo, materials.marbleMain, nicheCount * 4);
   nicheInst.castShadow = true;
   nicheInst.receiveShadow = true;
+
+  const nicheBackInst = new THREE.InstancedMesh(nicheBackGeo, plinthAoBackMat, nicheCount * 4);
+  nicheBackInst.receiveShadow = true;
+
+  const nicheSillInst = new THREE.InstancedMesh(nicheSillGeo, materials.marbleShadowRecess, nicheCount * 4);
+  nicheSillInst.receiveShadow = true;
 
   const pilasterInst = new THREE.InstancedMesh(pilasterGeo, materials.marbleTrim, (nicheCount + 1) * 4);
   pilasterInst.castShadow = true;
@@ -475,12 +874,30 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       dummy.scale.set(1, 1, 1);
       dummy.updateMatrix();
       dummy.matrix.premultiply(faceGroup.matrix);
-      nicheInst.setMatrixAt(nIdx++, dummy.matrix);
+      nicheInst.setMatrixAt(nIdx, dummy.matrix);
+
+      // Gradient AO recessed backing seated deeply inside the arch niche
+      dummy.position.set(lx, 0.42 + nicheH * 0.47, face.offsetZ + 0.04);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      dummy.matrix.premultiply(faceGroup.matrix);
+      nicheBackInst.setMatrixAt(nIdx, dummy.matrix);
+
+      // Carved inner marble bench/sill at the floor of each recessed blind arch
+      dummy.position.set(lx, 0.50, face.offsetZ + 0.24);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.updateMatrix();
+      dummy.matrix.premultiply(faceGroup.matrix);
+      nicheSillInst.setMatrixAt(nIdx, dummy.matrix);
+
+      nIdx += 1;
     }
 
     for (let i = 0; i <= nicheCount; i += 1) {
       const lx = -arcadeSpan * 0.5 + i * bayW;
-      dummy.position.set(lx, pH * 0.5, face.offsetZ + 0.22);
+      dummy.position.set(lx, pH * 0.5, face.offsetZ + 0.39);
       dummy.rotation.set(0, 0, 0);
       dummy.scale.set(1, 1, 1);
       dummy.updateMatrix();
@@ -490,9 +907,13 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
   }
   nicheInst.instanceMatrix.needsUpdate = true;
   nicheInst.computeBoundingSphere();
+  nicheBackInst.instanceMatrix.needsUpdate = true;
+  nicheBackInst.computeBoundingSphere();
+  nicheSillInst.instanceMatrix.needsUpdate = true;
+  nicheSillInst.computeBoundingSphere();
   pilasterInst.instanceMatrix.needsUpdate = true;
   pilasterInst.computeBoundingSphere();
-  plinthGroup.add(nicheInst, pilasterInst);
+  plinthGroup.add(nicheInst, nicheBackInst, nicheSillInst, pilasterInst);
 
   // Subtle decorative dark stone cornice band running around the top of the plinth
   const plinthDarkBand = new THREE.Mesh(
@@ -583,15 +1004,28 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
     ),
   );
   const pishtaqSideWallGeo = trackGeo(new THREE.BoxGeometry(1.45, pishtaqH, 2.7));
-  const pishtaqCapGeo = trackGeo(new THREE.BoxGeometry(pishtaqW + 0.56, 0.56, 2.55));
+  const pishtaqCapGeo = trackGeo(createBeveledBoxGeometry(pishtaqW + 0.6, 0.58, 2.58, 0.095));
   const pishtaqDarkFrameGeo = trackGeo(new THREE.BoxGeometry(pishtaqW + 0.22, 0.26, 2.0));
   const pishtaqSplayWallGeo = trackGeo(new THREE.BoxGeometry(2.6, pishtaqH * 0.78, 0.28));
   const vaultBackGeo = trackGeo(new THREE.PlaneGeometry(pishtaqW * 0.68, pishtaqH * 0.78));
 
-  // Inner sanctuary screen (doorway + upper arched jali window + marble balustrade inside the Great Iwan)
+  // Physical 3D Muqarnas honeycomb vaulting inside the upper arched head of each Great Pishtaq iwan
+  const muqarnas = createMuqarnasVaultGeometries(
+    pishtaqW * 0.66,
+    pishtaqH * 0.455,
+    pishtaqH * 0.76,
+    1.32,
+  );
+  const muqarnasCellsGeo = trackGeo(muqarnas.cellsGeo);
+  const muqarnasRibsGeo = trackGeo(muqarnas.ribsGeo);
+
+  // Inner sanctuary screen (doorway + upper arched jali window + physical 3D carved marble jali screens)
   const innerDoorFrameGeo = trackGeo(createPointedArchFrameGeometry(4.5, 5.2, 2.35, 2.5, 4.1, 0.62));
   const innerUpperWindowGeo = trackGeo(createPointedArchFrameGeometry(4.5, 4.6, 2.15, 2.0, 3.6, 0.55));
   const jaliBackingGeo = trackGeo(new THREE.BoxGeometry(3.4, 9.6, 0.25));
+  const pishtaqDoorJali3DGeo = trackGeo(createJaliLattice3DGeometry(2.38, 4.15, 4, 6, 0.052, 0.11));
+  const pishtaqUpperJali3DGeo = trackGeo(createJaliLattice3DGeometry(2.18, 3.65, 4, 5, 0.048, 0.10));
+  const sideBayJali3DGeo = trackGeo(createJaliLattice3DGeometry(2.05, 3.85, 3, 5, 0.052, 0.10));
   const merlonGeo = trackGeo(new THREE.ConeGeometry(0.2, 0.48, 4));
 
   // Flanking 2-story side bay arch frames (lower & upper alcoves with deeper shadow recess)
@@ -608,7 +1042,7 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       1.7,
     ),
   );
-  const sideBandGeo = trackGeo(new THREE.BoxGeometry(sideBayW + 0.28, 0.36, 1.98));
+  const sideBandGeo = trackGeo(createBeveledBoxGeometry(sideBayW + 0.3, 0.38, 2.02, 0.068));
   const sideDarkLineGeo = trackGeo(new THREE.BoxGeometry(sideBayW + 0.32, 0.12, 2.02));
   const sideVaultBackGeo = trackGeo(new THREE.PlaneGeometry(sideBayW * 0.72, lowerBayH * 0.86));
 
@@ -641,6 +1075,20 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
     const vaultBack = new THREE.Mesh(vaultBackGeo, materials.marbleDeepVault);
     vaultBack.position.set(0, pishtaqH * 0.39, halfW - 2.02);
     facade.add(vaultBack);
+
+    // Physical 3D carved Muqarnas honeycomb vaulting inside the upper Great Pishtaq iwan
+    // Blended in warm shaded Makrana marble tones so the vault reads as seamless carved stone
+    const muqarnasCells = new THREE.Mesh(muqarnasCellsGeo, materials.marbleMuqarnasVault);
+    muqarnasCells.position.set(0, 0, halfW - 0.66);
+    muqarnasCells.castShadow = true;
+    muqarnasCells.receiveShadow = true;
+    facade.add(muqarnasCells);
+
+    const muqarnasRibs = new THREE.Mesh(muqarnasRibsGeo, materials.marbleMuqarnasRib);
+    muqarnasRibs.position.set(0, 0, halfW - 0.66);
+    muqarnasRibs.castShadow = true;
+    muqarnasRibs.receiveShadow = true;
+    facade.add(muqarnasRibs);
 
     // Semi-octagonal splayed interior side walls inside the Great Iwan with carved dado relief niches
     for (const sx of [-1, 1]) {
@@ -707,17 +1155,29 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       facade.add(merlon);
     }
 
-    // Deep recessed interior doorway, perforated Jali lattice screen & upper arched window
+    // Deep recessed interior doorway, perforated Jali backing + finely carved 3D pierced marble Jali latticework
     const jaliBack = new THREE.Mesh(jaliBackingGeo, materials.jaliScreen);
-    jaliBack.position.set(0, 4.9, halfW - 1.92);
+    jaliBack.position.set(0, 4.9, halfW - 1.94);
     facade.add(jaliBack);
 
-    const innerDoor = new THREE.Mesh(innerDoorFrameGeo, materials.marbleInlayPanel);
+    const doorJali3D = new THREE.Mesh(pishtaqDoorJali3DGeo, materials.carvedJaliMarble);
+    doorJali3D.position.set(0, 2.08, halfW - 1.78);
+    doorJali3D.castShadow = true;
+    doorJali3D.receiveShadow = true;
+    facade.add(doorJali3D);
+
+    const upperJali3D = new THREE.Mesh(pishtaqUpperJali3DGeo, materials.carvedJaliMarble);
+    upperJali3D.position.set(0, 7.22, halfW - 1.74);
+    upperJali3D.castShadow = true;
+    upperJali3D.receiveShadow = true;
+    facade.add(upperJali3D);
+
+    const innerDoor = new THREE.Mesh(innerDoorFrameGeo, materials.marbleShadowRecess);
     innerDoor.position.set(0, 0, halfW - 1.82);
     innerDoor.receiveShadow = true;
     facade.add(innerDoor);
 
-    const innerUpper = new THREE.Mesh(innerUpperWindowGeo, materials.marbleInlayPanel);
+    const innerUpper = new THREE.Mesh(innerUpperWindowGeo, materials.marbleShadowRecess);
     innerUpper.position.set(0, 5.4, halfW - 1.78);
     innerUpper.receiveShadow = true;
     facade.add(innerUpper);
@@ -746,7 +1206,7 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       upperBay.receiveShadow = true;
       facade.add(upperBay);
 
-      // Deep shaded alcove backing behind both stacked arches + recessed jali doorway silhouette
+      // Deep shaded alcove backing behind both stacked arches + physical 3D carved marble jali screens
       const lowerBack = new THREE.Mesh(sideVaultBackGeo, materials.marbleDeepVault);
       lowerBack.position.set(bayX, lowerBayH * 0.44, halfW - 1.98);
       facade.add(lowerBack);
@@ -755,12 +1215,17 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       upperBack.position.set(bayX, upperBayH + lowerBayH * 0.44, halfW - 1.98);
       facade.add(upperBack);
 
-      const bayJali = new THREE.Mesh(
-        trackGeo(new THREE.PlaneGeometry(1.85, 3.6)),
-        materials.jaliScreen,
-      );
-      bayJali.position.set(bayX, 2.2, halfW - 1.94);
-      facade.add(bayJali);
+      const bayJaliLower = new THREE.Mesh(sideBayJali3DGeo, materials.carvedJaliMarble);
+      bayJaliLower.position.set(bayX, 2.1, halfW - 1.88);
+      bayJaliLower.castShadow = true;
+      bayJaliLower.receiveShadow = true;
+      facade.add(bayJaliLower);
+
+      const bayJaliUpper = new THREE.Mesh(sideBayJali3DGeo, materials.carvedJaliMarble);
+      bayJaliUpper.position.set(bayX, upperBayH + 2.0, halfW - 1.88);
+      bayJaliUpper.castShadow = true;
+      bayJaliUpper.receiveShadow = true;
+      facade.add(bayJaliUpper);
 
       // Horizontal stringcourse molding & dark shadow groove between tiers
       const midBand = new THREE.Mesh(sideBandGeo, materials.marbleTrim);
@@ -920,14 +1385,23 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
         minGroup.add(br);
       }
 
+      // Chamfered/beveled minaret balcony deck & carved stone rim lip catching golden sunlight
       const deck = new THREE.Mesh(
-        trackGeo(new THREE.CylinderGeometry(topR + 0.66, topR + 0.6, 0.24, 24)),
+        trackGeo(new THREE.CylinderGeometry(topR + 0.68, topR + 0.58, 0.26, 24)),
         materials.marbleMain,
       );
       deck.position.y = y + 0.6;
       deck.castShadow = true;
       deck.receiveShadow = true;
       minGroup.add(deck);
+
+      const deckRimBevel = new THREE.Mesh(
+        trackGeo(new THREE.TorusGeometry(topR + 0.65, 0.055, 6, 24)),
+        materials.marbleTrim,
+      );
+      deckRimBevel.rotation.x = Math.PI * 0.5;
+      deckRimBevel.position.y = y + 0.72;
+      minGroup.add(deckRimBevel);
 
       // Recessed dark arched balcony doorway opening facing the central mausoleum
       const doorRecess = new THREE.Mesh(
@@ -938,7 +1412,7 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       doorRecess.rotation.y = Math.atan2(-leanSignX, -leanSignZ);
       minGroup.add(doorRecess);
 
-      // Carved perforated balustrade parapet ring
+      // Carved perforated balustrade parapet ring + top chamfered stone handrail torus
       const parapet = new THREE.Mesh(
         trackGeo(new THREE.CylinderGeometry(topR + 0.58, topR + 0.58, 0.62, 24, 1, true)),
         materials.marbleInlayPanel,
@@ -946,6 +1420,14 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
       parapet.material.side = THREE.DoubleSide;
       parapet.position.y = y + 0.98;
       minGroup.add(parapet);
+
+      const parapetRail = new THREE.Mesh(
+        trackGeo(new THREE.TorusGeometry(topR + 0.58, 0.052, 6, 24)),
+        materials.marbleTrim,
+      );
+      parapetRail.rotation.x = Math.PI * 0.5;
+      parapetRail.position.y = y + 1.29;
+      minGroup.add(parapetRail);
 
       const darkBand = new THREE.Mesh(
         trackGeo(new THREE.CylinderGeometry(topR + 0.61, topR + 0.61, 0.1, 24)),
@@ -1100,6 +1582,9 @@ export function buildTajMahalStructure(materials: TajMaterialLibrary): TajStruct
     dispose: () => {
       for (const geo of geometries) {
         geo.dispose();
+      }
+      for (const mat of localMaterials) {
+        mat.dispose();
       }
     },
   };

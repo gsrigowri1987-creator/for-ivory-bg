@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   computeRiseTransform,
   computeTreeBreezeSway,
@@ -27,11 +26,12 @@ import {
   type FountainSprinklersHandles,
 } from './geometry/birdsAndSprinklers';
 import { buildGardenEnvironment, type GardenEnvironmentHandles } from './geometry/gardenEnvironment';
-import { buildSkyAndClouds, type SkyAndCloudsHandles } from './geometry/skyAndClouds';
+import { buildSkyAndClouds, generateSkyEnvMap, type SkyAndCloudsHandles } from './geometry/skyAndClouds';
 import { buildTajMahalStructure, type TajStructureHandles } from './geometry/tajStructure';
 import { createTajMaterials, type TajMaterialLibrary } from './materials';
 import {
   clampFirstPersonPosition,
+  computeCinematicParallax,
   computeLookAngles,
   computeWalkBobOffset,
   getGroundHeightAt,
@@ -39,6 +39,11 @@ import {
   RUN_SPEED_MPS,
   WALK_SPEED_MPS,
 } from './navigation';
+import {
+  PlanarWaterReflector,
+  TajPostProcessingPipeline,
+  type PerformanceTier,
+} from './postprocessing';
 import { createProceduralTextures, type ProceduralTextureSet } from './textures';
 
 export interface SceneHudSnapshot {
@@ -73,6 +78,22 @@ function detectSoftwareGl(): boolean {
   return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
 }
 
+function detectPerformanceTier(isSoftwareGl: boolean): PerformanceTier {
+  if (isSoftwareGl) return 'software';
+  const coarsePointer = typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches;
+  const mobileUa = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  const lowCores = typeof navigator.hardwareConcurrency === 'number' && navigator.hardwareConcurrency <= 4;
+  const narrowViewport = Math.min(window.innerWidth, window.innerHeight) < 700;
+  return coarsePointer || mobileUa || lowCores || narrowViewport ? 'mobile' : 'desktop';
+}
+
+function getCappedPixelRatio(tier: PerformanceTier): number {
+  if (tier === 'software') return 1;
+  if (tier === 'mobile') return Math.min(window.devicePixelRatio || 1, 1.5);
+  // True native 4K (3840x2160 on 2x HiDPI 1080p / native 4K monitors) without accidentally pushing 6K+ at 120Hz
+  return Math.min(window.devicePixelRatio || 1, 2.0);
+}
+
 // Module-scope reusable scratch objects (zero GC allocations inside render loop)
 const _targetPos = new THREE.Vector3();
 const _targetLook = new THREE.Vector3();
@@ -93,6 +114,8 @@ export class TajSceneController {
   private camera: THREE.PerspectiveCamera;
   private controls: OrbitControls;
   private envRT: THREE.WebGLRenderTarget;
+  private planarReflector: PlanarWaterReflector;
+  private postProcessing: TajPostProcessingPipeline;
 
   private textures: ProceduralTextureSet;
   private materials: TajMaterialLibrary;
@@ -109,6 +132,10 @@ export class TajSceneController {
   private fog: THREE.FogExp2;
 
   private isSoftwareGl: boolean;
+  private performanceTier: PerformanceTier;
+  private nonReflectedObjects: THREE.Object3D[] = [];
+  private smoothedRawDt = 1 / 60;
+  private frameCounter = 0;
   private frameId = 0;
   private disposed = false;
   private contextLost = false;
@@ -130,19 +157,27 @@ export class TajSceneController {
   // Camera & First-Person POV state
   private activeCameraPreset: CameraPresetId = 'pov_garden';
   private cameraMode: CameraControlMode = 'pov';
-  private activeLightingPreset: LightingPresetId = 'daylight';
+  private activeLightingPreset: LightingPresetId = 'golden';
   private cameraTransitionActive = false;
   private targetCamPos = new THREE.Vector3(...CAMERA_PRESETS[0].position);
   private targetCamLook = new THREE.Vector3(...CAMERA_PRESETS[0].target);
   private targetFov: number = CAMERA_PRESETS[0].fov;
 
-  // First-person eye orientation & locomotion
+  // First-person eye orientation, walkable base position, & subtle landing-page mouse-parallax
   private povYaw = 0;
   private povPitch = 0;
   private targetPovYaw = 0;
   private targetPovPitch = 0;
+  private basePovX = CAMERA_PRESETS[0].position[0];
+  private basePovZ = CAMERA_PRESETS[0].position[2];
   private povGroundY = CAMERA_PRESETS[0].position[1];
   private lockInitialEyeHeight = false;
+  private parallaxEnabled = true;
+  private mouseNormX = 0;
+  private mouseNormY = 0;
+  private smoothMouseX = 0;
+  private smoothMouseY = 0;
+  private parallaxBlend = 1.0;
   private walkPhase = 0;
   private walkBlend = 0;
   private isDraggingLook = false;
@@ -170,7 +205,6 @@ export class TajSceneController {
   private handlePointerDownBound: (e: PointerEvent) => void;
   private handlePointerMoveBound: (e: PointerEvent) => void;
   private handlePointerUpBound: (e: PointerEvent) => void;
-  private handleWheelBound: (e: WheelEvent) => void;
   private handleKeyDownBound: (e: KeyboardEvent) => void;
   private handleKeyUpBound: (e: KeyboardEvent) => void;
   private handleBlurBound: () => void;
@@ -179,50 +213,61 @@ export class TajSceneController {
     this.container = options.container;
     this.onHudUpdate = options.onHudUpdate;
     this.isSoftwareGl = detectSoftwareGl();
+    this.performanceTier = detectPerformanceTier(this.isSoftwareGl);
 
     const width = Math.max(this.container.clientWidth, 1);
     const height = Math.max(this.container.clientHeight, 1);
 
+    const pixelRatio = getCappedPixelRatio(this.performanceTier);
     this.renderer = new THREE.WebGLRenderer({
-      antialias: !this.isSoftwareGl,
+      antialias: false, // Handled crisply by EffectComposer MSAA + SMAA/FXAA
       powerPreference: 'high-performance',
     });
     this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(pixelRatio);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = LIGHTING_PRESETS.daylight.exposure;
-    this.renderer.shadowMap.enabled = !this.isSoftwareGl;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMappingExposure = LIGHTING_PRESETS.golden.exposure;
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    // Smart shadow caching: render 4096x4096 shadows on demand (during build, lighting change, and 15Hz tree-sway cadence)
+    // instead of re-rasterizing the entire monument 120 times/second!
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.domElement.style.display = 'block';
     this.renderer.domElement.style.width = '100%';
     this.renderer.domElement.style.height = '100%';
-    this.renderer.domElement.style.touchAction = 'none';
+    // Allow native vertical page scrolling over the full-screen background canvas
+    this.renderer.domElement.style.touchAction = 'pan-y';
     this.container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    const initialLight = LIGHTING_PRESETS.daylight;
+    const initialLight = LIGHTING_PRESETS.golden;
     this.scene.background = new THREE.Color(initialLight.skyHorizon);
     this.fog = new THREE.FogExp2(initialLight.fogColor, initialLight.fogDensity);
     this.scene.fog = this.fog;
 
-    // Procedural Studio Environment Reflections (mandatory on every device)
-    const pmrem = new THREE.PMREMGenerator(this.renderer);
-    this.envRT = pmrem.fromScene(new RoomEnvironment(), 0.04);
+    // Real-time HDRI Environment Reflections generated directly from the golden-hour Rayleigh/Mie sky
+    this.envRT = generateSkyEnvMap(this.renderer, initialLight);
     this.scene.environment = this.envRT.texture;
-    pmrem.dispose();
 
     // Initialize camera at First-Person POV eye level on the central Charbagh marble platform
-    // (Optional ?view=sprinkler positions a close-up POV beside the nearest reflecting-pool fountain)
+    // (Optional ?view=sprinkler or ?view=plinth positions close-up inspection views)
     const initialCam = CAMERA_PRESETS[0];
     const isSprinklerCloseup = options.initialView === 'sprinkler';
+    const isPlinthCloseup = options.initialView === 'plinth';
+    const plinthPreset = CAMERA_PRESETS.find((p) => p.id === 'pov_plinth');
     const startPos: [number, number, number] = isSprinklerCloseup
-      ? [1.42, 1.24, 96.15]
-      : initialCam.position;
+      ? [1.58, 1.32, 96.45]
+      : isPlinthCloseup && plinthPreset
+        ? plinthPreset.position
+        : initialCam.position;
     const startTarget: [number, number, number] = isSprinklerCloseup
-      ? [0, 0.84, 94.52]
-      : initialCam.target;
-    const startFov = isSprinklerCloseup ? 44 : initialCam.fov;
+      ? [0, 0.84, 92.8]
+      : isPlinthCloseup && plinthPreset
+        ? plinthPreset.target
+        : initialCam.target;
+    const startFov = isSprinklerCloseup ? 46 : isPlinthCloseup && plinthPreset ? plinthPreset.fov : initialCam.fov;
 
     this.camera = new THREE.PerspectiveCamera(startFov, width / height, 0.2, 1100);
     this.camera.rotation.order = 'YXZ';
@@ -234,13 +279,18 @@ export class TajSceneController {
     this.povPitch = initialAngles.pitch;
     this.targetPovYaw = initialAngles.yaw;
     this.targetPovPitch = initialAngles.pitch;
+    this.basePovX = startPos[0];
+    this.basePovZ = startPos[2];
     this.povGroundY = startPos[1];
-    this.lockInitialEyeHeight = isSprinklerCloseup;
+    this.lockInitialEyeHeight = isSprinklerCloseup || isPlinthCloseup;
+    this.parallaxEnabled = !isSprinklerCloseup && !isPlinthCloseup;
+    this.parallaxBlend = this.parallaxEnabled ? 1.0 : 0.0;
     this.camera.rotation.set(this.povPitch, this.povYaw, 0, 'YXZ');
 
-    // OrbitControls stays disabled during First-Person POV and enables cleanly in Aerial Orbit
+    // OrbitControls stays disabled & disconnected during First-Person POV so zero non-passive wheel listeners sit on the canvas
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.target.set(...initialCam.target);
+    this.controls.target.set(...startTarget);
+    this.controls.enableZoom = false;
     this.controls.enableDamping = !this.isSoftwareGl;
     this.controls.dampingFactor = 0.06;
     this.controls.maxPolarAngle = Math.PI * 0.492;
@@ -250,26 +300,33 @@ export class TajSceneController {
     this.controls.enabled = initialCam.mode === 'orbit';
     if (this.controls.enabled) {
       this.controls.update();
+    } else {
+      this.controls.disconnect();
     }
+    // Restore vertical touch scroll passthrough (OrbitControls constructor sets touchAction='none')
+    this.renderer.domElement.style.touchAction = 'pan-y';
 
     this.controls.addEventListener('start', () => {
       this.cameraTransitionActive = false;
     });
 
-    // 3-Point Realistic Daylight Rig for Makrana Marble, Foliage, and Yamuna River
+    // Physically accurate Golden-Hour Sun Light with crisp 4096px PCF soft shadows & tight monument frustum
+    const shadowSize =
+      this.performanceTier === 'desktop' ? 4096 : this.performanceTier === 'mobile' ? 2048 : 1024;
     this.sunLight = new THREE.DirectionalLight(initialLight.sunColor, initialLight.sunIntensity);
     this.sunLight.position.set(...initialLight.sunDirection);
-    this.sunLight.castShadow = !this.isSoftwareGl;
-    this.sunLight.shadow.mapSize.set(2048, 2048);
-    this.sunLight.shadow.camera.near = 10;
-    this.sunLight.shadow.camera.far = 280;
-    const d = 76;
+    this.sunLight.castShadow = true;
+    this.sunLight.shadow.mapSize.set(shadowSize, shadowSize);
+    this.sunLight.shadow.camera.near = 14;
+    this.sunLight.shadow.camera.far = 240;
+    const d = 66;
     this.sunLight.shadow.camera.left = -d;
     this.sunLight.shadow.camera.right = d;
     this.sunLight.shadow.camera.top = d;
     this.sunLight.shadow.camera.bottom = -d;
-    this.sunLight.shadow.bias = -0.0005;
-    this.sunLight.shadow.normalBias = 0.03;
+    this.sunLight.shadow.bias = -0.0003;
+    this.sunLight.shadow.normalBias = 0.025;
+    this.sunLight.shadow.radius = 2.0;
     this.scene.add(this.sunLight);
 
     this.hemiLight = new THREE.HemisphereLight(
@@ -280,27 +337,49 @@ export class TajSceneController {
     this.scene.add(this.hemiLight);
 
     this.fillLight = new THREE.DirectionalLight(initialLight.fillColor, initialLight.fillIntensity);
-    this.fillLight.position.set(-58, 38, -44);
+    this.fillLight.position.set(-64, 34, -48);
     this.scene.add(this.fillLight);
 
-    // Subtle warm sanctuary interior oil-lamp glow visible inside the Great Pishtaq archway at dusk & night
-    this.sanctuaryLantern = new THREE.PointLight('#ffbf78', 0, 26, 1.5);
-    this.sanctuaryLantern.position.set(0, TAJ_DIMS.plinthTopY + 5.2, TAJ_DIMS.mausoleumW * 0.5 - 0.6);
+    // Gentle recessed sanctuary interior oil-lamp warmth (subtle so doorway marble & muqarnas never blow out)
+    this.sanctuaryLantern = new THREE.PointLight('#ffbd76', 0.55, 16, 2.0);
+    this.sanctuaryLantern.position.set(0, TAJ_DIMS.plinthTopY + 3.6, TAJ_DIMS.mausoleumW * 0.5 - 1.48);
     this.scene.add(this.sanctuaryLantern);
 
-    // Procedural Textures & PBR Materials
+    // Procedural Ultra-HD 2048px PBR Textures & Materials with full max anisotropy
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.textures = createProceduralTextures(maxAniso);
+    this.textures = createProceduralTextures(maxAniso, this.performanceTier);
     this.materials = createTajMaterials(this.textures);
 
     // Build 3D World (Sky + Clouds + Stars/Moon, Gardens + Yamuna, Taj Mahal, Flying Birds, Intermittent Sprinklers)
     this.sky = buildSkyAndClouds(this.textures, initialLight);
-    this.garden = buildGardenEnvironment(this.materials);
+    this.garden = buildGardenEnvironment(this.materials, this.performanceTier);
     this.taj = buildTajMahalStructure(this.materials);
     this.birds = buildFlyingBirds();
     this.sprinklers = buildFountainSprinklers();
 
     this.scene.add(this.sky.root, this.garden.root, this.taj.root, this.birds.root, this.sprinklers.root);
+
+    // Hide invisible ground micro-detail & water-surface particles during planar reflection pass
+    this.nonReflectedObjects = [
+      ...this.garden.nonReflectedObjects,
+      this.sky.dustMotes,
+      ...this.sprinklers.surfaceSplashObjects,
+    ];
+
+    // Real-time Planar Water Reflector & AAA EffectComposer Post-Processing Pipeline
+    this.planarReflector = new PlanarWaterReflector(this.performanceTier);
+    this.postProcessing = new TajPostProcessingPipeline(
+      this.renderer,
+      this.scene,
+      this.camera,
+      width,
+      height,
+      pixelRatio,
+      this.performanceTier,
+    );
+    if (isSprinklerCloseup) {
+      this.postProcessing.setDofEnabled(false);
+    }
 
     // Record resting Y positions for build animation transforms
     this.basePlinthY = this.taj.plinthGroup.position.y;
@@ -329,7 +408,7 @@ export class TajSceneController {
       this.isBuilding = true;
     }
     this.applyBuildAnimation(this.buildElapsed);
-    this.setLightingPreset('daylight');
+    this.setLightingPreset('golden', false);
     const initSpray = this.sprinklers.update(
       2.6,
       Math.min(1, this.buildElapsed / TOTAL_BUILD_DURATION),
@@ -358,13 +437,14 @@ export class TajSceneController {
     this.handlePointerDownBound = this.handlePointerDown.bind(this);
     this.handlePointerMoveBound = this.handlePointerMove.bind(this);
     this.handlePointerUpBound = this.handlePointerUp.bind(this);
-    this.handleWheelBound = this.handleWheel.bind(this);
     this.handleKeyDownBound = this.handleKeyDown.bind(this);
     this.handleKeyUpBound = this.handleKeyUp.bind(this);
     this.handleBlurBound = () => {
       this.pressedKeys.clear();
       this.isDraggingLook = false;
       this.activePointerId = null;
+      this.mouseNormX = 0;
+      this.mouseNormY = 0;
     };
 
     const dom = this.renderer.domElement;
@@ -376,13 +456,16 @@ export class TajSceneController {
     window.addEventListener('pointermove', this.handlePointerMoveBound);
     window.addEventListener('pointerup', this.handlePointerUpBound);
     window.addEventListener('pointercancel', this.handlePointerUpBound);
-    dom.addEventListener('wheel', this.handleWheelBound, { passive: false });
     dom.addEventListener('webglcontextlost', this.handleContextLostBound);
     dom.addEventListener('webglcontextrestored', this.handleContextRestoredBound);
 
     this.pushHudState(true);
     this.lastNow = performance.now();
-    this.tick();
+    if (this.isSoftwareGl) {
+      this.frameId = window.setTimeout(this.tick, 16);
+    } else {
+      this.frameId = requestAnimationFrame(this.tick);
+    }
   }
 
   private handlePointerDown(e: PointerEvent): void {
@@ -395,6 +478,15 @@ export class TajSceneController {
   }
 
   private handlePointerMove(e: PointerEvent): void {
+    // Always track normalized pointer coordinates for subtle interactive landing-page parallax
+    if (e.pointerType !== 'touch') {
+      const rect = this.container.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        this.mouseNormX = Math.max(-1, Math.min(1, ((e.clientX - rect.left) / rect.width) * 2 - 1));
+        this.mouseNormY = Math.max(-1, Math.min(1, ((e.clientY - rect.top) / rect.height) * 2 - 1));
+      }
+    }
+
     if (!this.isDraggingLook || this.cameraMode !== 'pov') return;
     if (this.activePointerId !== null && e.pointerId !== this.activePointerId) return;
 
@@ -412,13 +504,6 @@ export class TajSceneController {
     if (this.activePointerId !== null && e.pointerId !== this.activePointerId) return;
     this.isDraggingLook = false;
     this.activePointerId = null;
-  }
-
-  private handleWheel(e: WheelEvent): void {
-    if (this.cameraMode !== 'pov') return;
-    e.preventDefault();
-    this.cameraTransitionActive = false;
-    this.targetFov = Math.max(34, Math.min(66, this.targetFov + e.deltaY * 0.018));
   }
 
   private handleKeyDown(e: KeyboardEvent): void {
@@ -482,11 +567,15 @@ export class TajSceneController {
 
     if (preset.mode === 'pov') {
       this.controls.enabled = false;
+      this.controls.disconnect();
+      this.renderer.domElement.style.touchAction = 'pan-y';
       const angles = computeLookAngles(preset.position, preset.target);
       this.povYaw = angles.yaw;
       this.povPitch = angles.pitch;
       this.targetPovYaw = angles.yaw;
       this.targetPovPitch = angles.pitch;
+      this.basePovX = preset.position[0];
+      this.basePovZ = preset.position[2];
       this.povGroundY = preset.position[1];
       this.camera.position.copy(this.targetCamPos);
       this.camera.fov = this.targetFov;
@@ -494,7 +583,9 @@ export class TajSceneController {
       this.camera.updateProjectionMatrix();
       this.cameraTransitionActive = false;
     } else {
+      this.controls.connect(this.renderer.domElement);
       this.controls.enabled = true;
+      this.renderer.domElement.style.touchAction = 'pan-y';
       if (this.isSoftwareGl) {
         this.camera.position.copy(this.targetCamPos);
         this.controls.target.copy(this.targetCamLook);
@@ -510,7 +601,7 @@ export class TajSceneController {
     this.pushHudState(true);
   }
 
-  public setLightingPreset(presetId: LightingPresetId): void {
+  public setLightingPreset(presetId: LightingPresetId, rebuildEnv = true): void {
     const preset = LIGHTING_PRESETS[presetId];
     if (!preset) return;
     this.activeLightingPreset = presetId;
@@ -527,7 +618,7 @@ export class TajSceneController {
     this.fillLight.intensity = preset.fillIntensity;
 
     const nightFactor = presetId === 'moonlight' ? 1.0 : 0.0;
-    this.sanctuaryLantern.intensity = presetId === 'moonlight' ? 18.0 : presetId === 'golden' ? 4.0 : 0.0;
+    this.sanctuaryLantern.intensity = presetId === 'moonlight' ? 7.5 : presetId === 'golden' ? 0.55 : 0.0;
 
     this.fog.color.set(preset.fogColor);
     this.fog.density = preset.fogDensity;
@@ -537,19 +628,33 @@ export class TajSceneController {
       this.scene.background = new THREE.Color(preset.skyHorizon);
     }
     this.renderer.toneMappingExposure = preset.exposure;
+    this.postProcessing.setExposure(preset.exposure);
+    this.renderer.shadowMap.needsUpdate = true;
 
-    this.sky.applyLighting(preset);
-    this.birds.applyTint(preset.sunColor, nightFactor);
-    this.sprinklers.applyTint(preset.sunColor, preset.skyHorizon, nightFactor);
+    if (rebuildEnv) {
+      const nextEnv = generateSkyEnvMap(this.renderer, preset);
+      this.scene.environment = nextEnv.texture;
+      this.envRT.dispose();
+      this.envRT = nextEnv;
+    }
 
     _sunPosScratch.set(...preset.sunDirection).normalize();
 
-    // Sync reflecting pool water lighting uniforms
+    this.sky.applyLighting(preset);
+    this.birds.applyTint(preset.sunColor, nightFactor, _sunPosScratch, preset.fogColor, preset.fogDensity);
+    this.sprinklers.applyTint(preset.sunColor, preset.skyHorizon, nightFactor, _sunPosScratch);
+    this.postProcessing.setLightingMode(presetId);
+
+    this.materials.updateSunUniforms(_sunPosScratch, new THREE.Color(preset.sunColor));
+
+    // Sync reflecting pool water lighting & distance haze uniforms
     const waterUniforms = this.materials.water.uniforms;
     waterUniforms.uSkyColor.value.set(preset.waterSkyTint);
     waterUniforms.uHorizonColor.value.set(preset.skyHorizon);
     waterUniforms.uSunColor.value.set(preset.sunColor);
     waterUniforms.uSunDir.value.copy(_sunPosScratch);
+    waterUniforms.uFogColor.value.set(preset.fogColor);
+    waterUniforms.uFogDensity.value = preset.fogDensity;
 
     // Sync Yamuna River water lighting uniforms
     const riverUniforms = this.materials.yamunaRiver.uniforms;
@@ -649,8 +754,14 @@ export class TajSceneController {
     const targetBreeze = this.breezeEnabled ? 1.0 : 0.0;
     this.breezeStrength = THREE.MathUtils.damp(this.breezeStrength, targetBreeze, 4.0, dt);
 
-    // Move volumetric clouds continuously across the sky dome
+    // Update slow-drifting cloud shadows & GPU wind-swaying 3D foreground grass blades
+    this.materials.updateEnvironmentTime(this.worldElapsed, this.breezeStrength);
+
+    // Move volumetric clouds, diagonal sunbeams & drifting ground mist continuously
     this.sky.update(this.worldElapsed, this.breezeStrength);
+
+    // Gently drift fallen leaves & flower petals across the reflecting pool surface
+    this.garden.updateFloatingClutter(this.worldElapsed, this.breezeStrength);
 
     // Animate soaring & flapping birds around the Taj Mahal, pool, and Yamuna River
     this.birds.update(this.worldElapsed + 2.4);
@@ -668,9 +779,14 @@ export class TajSceneController {
     this.sprinklersActive = nextSprinklersActive;
     this.materials.water.uniforms.uSprinklerIntensity.value = sprayIntensity;
 
-    // Gentle travelling breeze wave across every cypress, shade tree, and far riverbank tree
-    for (const item of this.garden.swayingTrees) {
+    // Gentle travelling breeze wave across every cypress, shade tree, and far riverbank tree (preserving organic lean)
+    // Pace distant far-riverbank trees at half-rate on 120Hz displays (imperceptible at >100m, saves CPU matrix math)
+    const updateFarTrees = (this.frameCounter & 1) === 0;
+    const swaying = this.garden.swayingTrees;
+    for (let i = 0; i < swaying.length; i += 1) {
+      const item = swaying[i];
       if (!item.group.visible) continue;
+      if (!updateFarTrees && item.worldZ < -46) continue;
       const angles = computeTreeBreezeSway(
         item.worldX,
         item.worldZ,
@@ -678,8 +794,8 @@ export class TajSceneController {
         this.breezeStrength,
         item.heightFactor,
       );
-      item.group.rotation.x = angles.rotX;
-      item.group.rotation.z = angles.rotZ;
+      item.group.rotation.x = item.baseLeanX + angles.rotX;
+      item.group.rotation.z = item.baseLeanZ + angles.rotZ;
     }
 
     // Animate breeze ripples on the reflecting pool and flowing current on the Yamuna River
@@ -730,11 +846,11 @@ export class TajSceneController {
       }
 
       const clamped = clampFirstPersonPosition(
-        this.camera.position.x + moveX,
-        this.camera.position.z + moveZ,
+        this.basePovX + moveX,
+        this.basePovZ + moveZ,
       );
-      this.camera.position.x = clamped.x;
-      this.camera.position.z = clamped.z;
+      this.basePovX = clamped.x;
+      this.basePovZ = clamped.z;
       this.walkPhase += dt * (speed > WALK_SPEED_MPS ? 11.5 : 8.2);
     }
 
@@ -745,12 +861,36 @@ export class TajSceneController {
       this.lockInitialEyeHeight = false;
     }
     if (!this.lockInitialEyeHeight) {
-      const desiredEyeY = getGroundHeightAt(this.camera.position.x, this.camera.position.z) + HUMAN_EYE_HEIGHT;
+      const desiredEyeY = getGroundHeightAt(this.basePovX, this.basePovZ) + HUMAN_EYE_HEIGHT;
       this.povGroundY = THREE.MathUtils.damp(this.povGroundY, desiredEyeY, 8.5, dt);
     }
-    this.camera.position.y = this.povGroundY + computeWalkBobOffset(this.walkPhase, this.walkBlend);
 
-    this.camera.rotation.set(this.povPitch, this.povYaw, 0, 'YXZ');
+    // Subtle award-winning mouse-parallax + slow ambient breathing drift when admiring the vista
+    const wantParallax = this.parallaxEnabled && !this.isDraggingLook && !isMoving ? 1.0 : 0.0;
+    this.parallaxBlend = THREE.MathUtils.damp(this.parallaxBlend, wantParallax, 3.2, dt);
+    this.smoothMouseX = THREE.MathUtils.damp(this.smoothMouseX, this.mouseNormX, 3.8, dt);
+    this.smoothMouseY = THREE.MathUtils.damp(this.smoothMouseY, this.mouseNormY, 3.8, dt);
+    const parallax = computeCinematicParallax(
+      this.smoothMouseX,
+      this.smoothMouseY,
+      this.worldElapsed,
+      this.parallaxBlend,
+    );
+
+    const cosYaw = Math.cos(this.povYaw);
+    const sinYaw = Math.sin(this.povYaw);
+    this.camera.position.set(
+      this.basePovX + cosYaw * parallax.posOffsetX,
+      this.povGroundY + computeWalkBobOffset(this.walkPhase, this.walkBlend) + parallax.posOffsetY,
+      this.basePovZ - sinYaw * parallax.posOffsetX,
+    );
+
+    this.camera.rotation.set(
+      this.povPitch + parallax.pitchOffset,
+      this.povYaw + parallax.yawOffset,
+      0,
+      'YXZ',
+    );
   }
 
   private updateCameraTransition(dt: number): void {
@@ -833,15 +973,15 @@ export class TajSceneController {
         }
         const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
         if (state === gl.UNSIGNALED) {
-          this.frameId = window.setTimeout(poll, 5);
+          this.frameId = window.setTimeout(poll, 10);
         } else {
           if (sync) gl.deleteSync(sync);
-          this.frameId = window.setTimeout(cb, 80);
+          this.frameId = window.setTimeout(cb, 220);
         }
       };
-      this.frameId = window.setTimeout(poll, 5);
+      this.frameId = window.setTimeout(poll, 10);
     } else {
-      this.frameId = window.setTimeout(cb, 90);
+      this.frameId = window.setTimeout(cb, 220);
     }
   }
 
@@ -851,6 +991,7 @@ export class TajSceneController {
     const now = performance.now();
     const rawDt = Math.max(0.001, (now - this.lastNow) / 1000);
     this.lastNow = now;
+    this.smoothedRawDt = this.smoothedRawDt * 0.9 + Math.min(rawDt, 0.05) * 0.1;
     const clampedDt = Math.min(rawDt, 0.25);
 
     this.worldElapsed += Math.min(rawDt, 1.2);
@@ -860,6 +1001,7 @@ export class TajSceneController {
       this.applyBuildAnimation(this.buildElapsed);
       if (this.buildElapsed >= TOTAL_BUILD_DURATION) {
         this.isBuilding = false;
+        this.renderer.shadowMap.needsUpdate = true;
         this.pushHudState(true);
       } else {
         this.pushHudState(false);
@@ -880,7 +1022,46 @@ export class TajSceneController {
     }
 
     if (!this.contextLost) {
-      this.renderer.render(this.scene, this.camera);
+      this.frameCounter += 1;
+
+      // Smart 4096x4096 shadow map update cadence:
+      // - Always bake on frame 1
+      // - Every 2nd frame while rising during the <10s construction animation
+      // - Every 8th frame (~15Hz at 120 FPS) at rest so gentle tree-breeze shadows stay alive with 87.5% less shadow GPU cost!
+      const shadowMapReady = this.sunLight.shadow.map !== null;
+      if (
+        !shadowMapReady ||
+        (this.isBuilding && (this.frameCounter & 1) === 0) ||
+        (!this.isBuilding && this.frameCounter % 8 === 0)
+      ) {
+        this.renderer.shadowMap.needsUpdate = true;
+      }
+
+      if (this.garden.terraceAndPoolGroup.visible) {
+        // High-refresh smart reflection pacing:
+        // On 120Hz displays (smoothedRawDt < 11.5ms) during gentle resting parallax, update live mirror at 60Hz (every 2nd frame),
+        // and update every frame during active camera drag/movement or on 60Hz displays!
+        const isHighRefresh = this.smoothedRawDt < 0.0115;
+        const isFastCameraMove = this.isDraggingLook || this.pressedKeys.size > 0 || this.cameraTransitionActive;
+        const shouldUpdateReflection =
+          this.frameCounter === 1 ||
+          !shadowMapReady ||
+          isFastCameraMove ||
+          (this.performanceTier === 'desktop' && !isHighRefresh) ||
+          (this.performanceTier === 'software' ? this.frameCounter % 4 === 0 : (this.frameCounter & 1) === 0);
+
+        if (shouldUpdateReflection) {
+          this.planarReflector.update(
+            this.renderer,
+            this.scene,
+            this.camera,
+            this.garden.waterSurface,
+            true,
+            this.nonReflectedObjects,
+          );
+        }
+      }
+      this.postProcessing.render();
     }
 
     if (this.isSoftwareGl) {
@@ -894,10 +1075,12 @@ export class TajSceneController {
     if (this.disposed) return;
     const width = Math.max(this.container.clientWidth, 1);
     const height = Math.max(this.container.clientHeight, 1);
+    const pixelRatio = getCappedPixelRatio(this.performanceTier);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(pixelRatio);
+    this.postProcessing.setSize(width, height, pixelRatio);
   }
 
   public dispose(): void {
@@ -914,11 +1097,12 @@ export class TajSceneController {
     window.removeEventListener('pointermove', this.handlePointerMoveBound);
     window.removeEventListener('pointerup', this.handlePointerUpBound);
     window.removeEventListener('pointercancel', this.handlePointerUpBound);
-    dom.removeEventListener('wheel', this.handleWheelBound);
     dom.removeEventListener('webglcontextlost', this.handleContextLostBound);
     dom.removeEventListener('webglcontextrestored', this.handleContextRestoredBound);
 
     this.controls.dispose();
+    this.planarReflector.dispose();
+    this.postProcessing.dispose();
     this.taj.dispose();
     this.garden.dispose();
     this.sky.dispose();

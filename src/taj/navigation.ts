@@ -124,3 +124,43 @@ export function computeLookAngles(
   const pitch = Math.atan2(dy, Math.max(horiz, 0.0001));
   return { yaw, pitch };
 }
+
+export interface CinematicParallaxOffset {
+  yawOffset: number;
+  pitchOffset: number;
+  posOffsetX: number;
+  posOffsetY: number;
+}
+
+/**
+ * Compute subtle award-winning landing-page camera motion combining gentle mouse-parallax
+ * look/sway with a slow, organic cinematic breathing drift. Bounded tightly so the monument
+ * remains majestically framed at all times.
+ */
+export function computeCinematicParallax(
+  mouseNormX: number,
+  mouseNormY: number,
+  elapsedSec: number,
+  strength = 1.0,
+): CinematicParallaxOffset {
+  const s = Math.max(0, Math.min(1, strength));
+  if (s <= 0) {
+    return { yawOffset: 0, pitchOffset: 0, posOffsetX: 0, posOffsetY: 0 };
+  }
+  const mx = Math.max(-1, Math.min(1, mouseNormX));
+  const my = Math.max(-1, Math.min(1, mouseNormY));
+
+  // Slow organic cinematic breathing drift (~17s & ~25s periods)
+  const driftYaw = Math.sin(elapsedSec * 0.26) * 0.009 + Math.sin(elapsedSec * 0.15 + 1.1) * 0.005;
+  const driftPitch = Math.sin(elapsedSec * 0.21 + 0.6) * 0.0045;
+  const driftX = Math.sin(elapsedSec * 0.23 + 0.4) * 0.18;
+  const driftY = Math.cos(elapsedSec * 0.31) * 0.045;
+
+  // Responsive yet restrained mouse-driven parallax tilt & micro-translation
+  const yawOffset = (-mx * 0.032 + driftYaw) * s;
+  const pitchOffset = (-my * 0.018 + driftPitch) * s;
+  const posOffsetX = (mx * 0.42 + driftX) * s;
+  const posOffsetY = (-my * 0.12 + driftY) * s;
+
+  return { yawOffset, pitchOffset, posOffsetX, posOffsetY };
+}

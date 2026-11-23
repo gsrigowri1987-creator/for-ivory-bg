@@ -212,19 +212,26 @@ export interface BirdFlightPose {
   x: number;
   y: number;
   z: number;
-  /** Yaw heading in radians (aligned with velocity vector) */
+  /** Yaw heading in radians (aligned with velocity vector, +Z nose) */
   yaw: number;
   /** Pitch angle in radians (climbing vs descending) */
   pitch: number;
   /** Aerodynamic banking roll into turns (radians) */
   bank: number;
-  /** Wing dihedral angle in radians (alternating flapping bursts & smooth glides) */
+  /** Inner wing (shoulder/humerus) angle in radians */
   wingAngle: number;
+  /** Hinged outer wingtip (wrist/primary feathers) articulation angle relative to inner wing (radians) */
+  outerWingAngle: number;
+  /** Smooth 0..1 thermal glide factor (0 = active wingbeat burst, 1 = poised soaring glide) */
+  glideFactor: number;
+  /** Subtle vertical body recoil synchronized with flapping downstrokes (meters) */
+  bodyBob: number;
 }
 
 /**
- * Evaluate smooth 3D position, heading, banking roll, and natural flap/glide wing angle
+ * Evaluate smooth 3D position, heading, banking roll, and articulated two-segment wing kinematics
  * for a soaring bird circling the Taj Mahal gardens, domes, and Yamuna River.
+ * Alternates organically between short energetic wingbeat bursts (3-5 flaps) and long thermal glides.
  */
 export function computeBirdFlightPose(spec: BirdFlightSpec, elapsedSec: number): BirdFlightPose {
   const samplePos = (t: number) => {
@@ -232,15 +239,15 @@ export function computeBirdFlightPose(spec: BirdFlightSpec, elapsedSec: number):
     const x =
       spec.centerX +
       Math.cos(theta) * spec.radiusX +
-      Math.sin(theta * 2.0) * spec.figureEightAmp;
+      Math.sin(theta * 2.0 + spec.phase * 0.4) * spec.figureEightAmp;
     const z =
       spec.centerZ +
       Math.sin(theta) * spec.radiusZ +
-      Math.cos(theta * 1.5) * spec.figureEightAmp * 0.55;
+      Math.cos(theta * 1.5 - spec.phase * 0.3) * spec.figureEightAmp * 0.55;
     const y =
       spec.baseAltitude +
       Math.sin(theta * 1.5 + spec.phase) * spec.altitudeWave +
-      Math.cos(t * 0.45 + spec.phase) * 1.1;
+      Math.cos(t * 0.42 + spec.phase) * 1.05;
     return { x, y, z };
   };
 
@@ -256,29 +263,53 @@ export function computeBirdFlightPose(spec: BirdFlightSpec, elapsedSec: number):
 
   // Forward heading aligned with +Z nose convention
   const yaw = Math.atan2(vx, vz);
-  const pitch = Math.max(-0.42, Math.min(0.42, Math.atan2(vy, horizSpeed)));
+  const pitch = Math.max(-0.38, Math.min(0.38, Math.atan2(vy, horizSpeed) * 0.85));
 
-  // Curvature-driven banking roll into turns
+  // Smooth curvature-driven aerodynamic banking roll into turns
   const ax = (next.x - 2 * curr.x + prev.x) / (dtSample * dtSample);
   const az = (next.z - 2 * curr.z + prev.z) / (dtSample * dtSample);
   const lateralAccel = (vx * az - vz * ax) / horizSpeed;
-  const bank = Math.max(-0.55, Math.min(0.55, -lateralAccel * 0.22));
+  const bank = Math.max(-0.55, Math.min(0.55, -lateralAccel * 0.24));
 
-  // Alternate organically between active wingbeats (~60% of time) and poised soaring glides (~40%)
-  const glideCycle = Math.sin(elapsedSec * 0.72 + spec.phase * 1.9);
-  const flapEnvelope = glideCycle > -0.25 ? clamp01((glideCycle + 0.25) / 0.45) : 0;
-  const flapWave = Math.sin(elapsedSec * spec.flapSpeed + spec.phase * 3.1);
-  // Subtle upward V-dihedral during glides, wide energetic stroke during flaps
-  const wingAngle = 0.14 + flapEnvelope * flapWave * 0.62;
+  // Realistic alternating short wingbeat bursts (3-5 flaps, ~2.1s) and long serene thermal glides (~4.1s)
+  const cyclePeriod = 6.2 + (Math.abs(spec.phase * 1.3) % 2.2);
+  const cyclePos = (((elapsedSec + spec.phase * 1.85) % cyclePeriod) + cyclePeriod) % cyclePeriod;
+  const flapDuration = 2.05 + (Math.abs(spec.phase * 2.9) % 0.7);
+  const smoothstep = (e0: number, e1: number, v: number) => {
+    const t = clamp01((v - e0) / Math.max(0.0001, e1 - e0));
+    return t * t * (3 - 2 * t);
+  };
+  const rampIn = smoothstep(0.0, 0.34, cyclePos);
+  const rampOut = 1.0 - smoothstep(flapDuration - 0.38, flapDuration, cyclePos);
+  const climbNudge = Math.max(0, Math.min(0.28, vy * 0.25));
+  const flapEnvelope = clamp01(rampIn * rampOut + climbNudge * (1.0 - smoothstep(flapDuration, flapDuration + 1.1, cyclePos)));
+  const glideFactor = clamp01(1.0 - flapEnvelope);
+
+  // Two-segment articulated wing kinematics:
+  // Inner arm drives crisp power strokes; outer wrist/primaries lag ~0.85 rad for lifelike feather flex
+  // and settle into a delicate upward thermal dihedral curl during glides
+  const flapPhase = elapsedSec * spec.flapSpeed + spec.phase * 3.1;
+  const innerStroke = Math.sin(flapPhase) * 0.58 + Math.sin(flapPhase * 2.0 - 0.5) * 0.08;
+  const outerWhip = Math.sin(flapPhase - 0.85) * 0.56 - Math.cos(flapPhase) * 0.14;
+
+  const glideInnerDihedral = 0.08 + Math.sin(elapsedSec * 1.1 + spec.phase * 2.1) * 0.04;
+  const glideOuterCurl = 0.16 + Math.sin(elapsedSec * 1.35 + spec.phase * 2.7) * 0.055;
+
+  const wingAngle = innerStroke * flapEnvelope + glideInnerDihedral * glideFactor;
+  const outerWingAngle = outerWhip * flapEnvelope + glideOuterCurl * glideFactor;
+  const bodyBob = -Math.sin(flapPhase) * 0.048 * flapEnvelope;
 
   return {
     x: curr.x,
-    y: curr.y,
+    y: curr.y + bodyBob,
     z: curr.z,
     yaw,
     pitch,
     bank,
     wingAngle,
+    outerWingAngle,
+    glideFactor,
+    bodyBob,
   };
 }
 

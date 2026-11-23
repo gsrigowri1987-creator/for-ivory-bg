@@ -14,6 +14,7 @@ import {
 } from './animation';
 import {
   clampFirstPersonPosition,
+  computeCinematicParallax,
   computeLookAngles,
   computeWalkBobOffset,
   getGroundHeightAt,
@@ -143,13 +144,44 @@ test('flying birds stay airborne with bounded banking and smooth flapping/glidin
 
   let minWing = Infinity;
   let maxWing = -Infinity;
-  for (let t = 0; t <= 12; t += 0.25) {
+  let minOuter = Infinity;
+  let maxOuter = -Infinity;
+  let sawFlap = false;
+  let sawGlide = false;
+  for (let t = 0; t <= 12; t += 0.15) {
     const pose = computeBirdFlightPose(spec, t);
     assert.ok(pose.y > 18, 'bird remains safely airborne');
     assert.ok(Math.abs(pose.pitch) <= 0.45);
     assert.ok(Math.abs(pose.bank) <= 0.6);
+    assert.ok(pose.glideFactor >= 0 && pose.glideFactor <= 1);
     minWing = Math.min(minWing, pose.wingAngle);
     maxWing = Math.max(maxWing, pose.wingAngle);
+    minOuter = Math.min(minOuter, pose.outerWingAngle);
+    maxOuter = Math.max(maxOuter, pose.outerWingAngle);
+    if (pose.glideFactor < 0.2) sawFlap = true;
+    if (pose.glideFactor > 0.85) sawGlide = true;
   }
-  assert.ok(maxWing - minWing > 0.4, 'bird wings visibly flap over time');
+  assert.ok(maxWing - minWing > 0.4, 'bird inner wings visibly flap over time');
+  assert.ok(maxOuter - minOuter > 0.35, 'articulated outer wingtips flex independently');
+  assert.ok(sawFlap && sawGlide, 'birds alternate naturally between flapping bursts and thermal glides');
+});
+
+test('cinematic mouse-parallax & drift helper stays tightly bounded and scales smoothly with strength', () => {
+  const zero = computeCinematicParallax(0.8, -0.6, 5.2, 0);
+  assert.equal(zero.yawOffset, 0);
+  assert.equal(zero.pitchOffset, 0);
+  assert.equal(zero.posOffsetX, 0);
+  assert.equal(zero.posOffsetY, 0);
+
+  const left = computeCinematicParallax(-1, 0, 0, 1);
+  const right = computeCinematicParallax(1, 0, 0, 1);
+  assert.ok(left.yawOffset > right.yawOffset, 'horizontal mouse movement tilts yaw smoothly');
+  assert.ok(right.posOffsetX > left.posOffsetX, 'horizontal mouse movement adds subtle lateral parallax');
+  assert.ok(Math.abs(right.yawOffset) < 0.06, 'yaw offset stays restrained');
+  assert.ok(Math.abs(right.posOffsetX) < 0.75, 'position parallax stays restrained');
+
+  const up = computeCinematicParallax(0, -1, 0, 1);
+  const down = computeCinematicParallax(0, 1, 0, 1);
+  assert.ok(up.pitchOffset > down.pitchOffset, 'vertical mouse movement tilts pitch smoothly');
+  assert.ok(Math.abs(up.pitchOffset) < 0.04, 'pitch offset stays restrained');
 });

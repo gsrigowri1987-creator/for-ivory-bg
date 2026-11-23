@@ -93,7 +93,7 @@ export default function App() {
       <div
         ref={canvasMountRef}
         data-testid="taj-webgl-canvas"
-        className="h-full w-full cursor-grab active:cursor-grabbing"
+        className="h-full w-full cursor-default"
       />
 
       {/* Graceful WebGL fallback only if WebGL fails */}
